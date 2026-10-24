@@ -52,20 +52,14 @@ jobs:
           sudo apt-get clean
           df -h /
 
-      - name: Install build deps
+      - name: Install build deps + clang
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            bc bison flex libssl-dev libelf-dev python3 rsync cpio zip unzip xz-utils kmod
-
-      - name: Install AOSP clang
-        run: |
-          set -euo pipefail
-          mkdir -p "$HOME/tc/clang"
-          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${{ inputs.clang_tag }}.tar.gz"
-          curl -sSL --retry 5 "$URL" -o /tmp/clang.tar.gz
-          tar -xzf /tmp/clang.tar.gz -C "$HOME/tc/clang"
-          "$HOME/tc/clang/bin/clang" --version
+            bc bison flex libssl-dev libelf-dev python3 rsync cpio zip unzip xz-utils kmod \
+            clang lld llvm
+          clang --version
+          ld.lld --version
 
       - name: Clone kernel source
         run: |
@@ -81,7 +75,6 @@ jobs:
         run: |
           set -euo pipefail
           cd kernel
-          export PATH="$HOME/tc/clang/bin:$PATH"
 
           make ARCH=arm64 LLVM=1 defconfig
           ./scripts/kconfig/merge_config.sh -m .config tigerkitty.fragment
@@ -114,14 +107,12 @@ jobs:
         run: |
           set -euo pipefail
           cd kernel
-          export PATH="$HOME/tc/clang/bin:$PATH"
           make ARCH=arm64 LLVM=1 -j"$(nproc)" vmlinux
 
       - name: Build wifi modules
         run: |
           set -euo pipefail
           cd kernel
-          export PATH="$HOME/tc/clang/bin:$PATH"
           set +e
           make ARCH=arm64 LLVM=1 -j"$(nproc)" \
             net/wireless/ net/mac80211/ drivers/net/wireless/ drivers/net/usb/ 2>&1 | tail -80
