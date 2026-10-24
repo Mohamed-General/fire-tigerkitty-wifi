@@ -1,0 +1,166 @@
+name: Build GKI wifi modules (crDroid fire / TigerKitty)
+
+# Builds wifi driver modules (.ko) for the exact kernel shipped by crDroid 12.12
+# for Redmi 12 (fire) = TigerKitty 6.6.143 by B055nian.
+#
+# Why this is easy on this ROM:
+#   * kernel is built with  # CONFIG_MODVERSIONS is not set  -> no symbol CRCs
+#   * kernel source + defconfig + fragment are public
+#   * TigerKitty patch makes vermagic mismatches non-fatal as well
+#   * CONFIG_MODULE_SIG_FORCE is not set -> unsigned modules load (taint only)
+#
+# Source: https://github.com/lvd3767/android_kernel_xiaomi_fire_gki6.6-tigerkitty
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "kernel source repository"
+        type: string
+        default: "https://github.com/lvd3767/android_kernel_xiaomi_fire_gki6.6-tigerkitty.git"
+      kernel_ref:
+        description: "branch / tag / commit"
+        type: string
+        default: "main"
+      localversion:
+        description: "CONFIG_LOCALVERSION override (empty = keep repo fragment value)"
+        type: string
+        default: "-TigerKitty-by-B055nian-g93bbc15e5f81-dirty"
+      clang_tag:
+        description: "AOSP clang prebuilt tag"
+        type: string
+        default: "clang-r510928"
+      extra_configs:
+        description: "extra =m options (space separated CONFIG names)"
+        type: string
+        default: "MAC80211 CFG80211 RTL8XXXU ATH9K_HTC ATH9K_HW ATH9K_COMMON RT2800USB RT2X00LIB RT2X00USB CARL9170 ZD1211RW MT7601U USB_RTL8187 RTL8187 RFKILL"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout build repo
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/lib/jvm /usr/local/.ghcup 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev python3 rsync cpio zip unzip xz-utils kmod
+
+      - name: Install AOSP clang
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/tc/clang"
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${{ inputs.clang_tag }}.tar.gz"
+          curl -sSL --retry 5 "$URL" -o /tmp/clang.tar.gz
+          tar -xzf /tmp/clang.tar.gz -C "$HOME/tc/clang"
+          "$HOME/tc/clang/bin/clang" --version
+
+      - name: Clone kernel source
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ inputs.kernel_ref }}" \
+            "${{ inputs.kernel_repo }}" kernel
+          cd kernel
+          git log --oneline -1
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)' Makefile
+          ls arch/arm64/configs/ | head
+
+      - name: Prepare config
+        run: |
+          set -euo pipefail
+          cd kernel
+          export PATH="$HOME/tc/clang/bin:$PATH"
+
+          make ARCH=arm64 LLVM=1 defconfig
+          ./scripts/kconfig/merge_config.sh -m .config tigerkitty.fragment
+
+          for c in ${{ inputs.extra_configs }}; do
+            echo "  forcing CONFIG_$c=m"
+            ./scripts/config --file .config --module "$c" || true
+          done
+
+          # things that only slow us down / need extra host tools
+          ./scripts/config --file .config \
+            --disable LTO_CLANG_THIN --disable LTO_CLANG_FULL --enable LTO_NONE \
+            --disable DEBUG_INFO_BTF --disable DEBUG_INFO_BTF_MODULES \
+            --disable WERROR || true
+
+          if [ -n "${{ inputs.localversion }}" ]; then
+            ./scripts/config --file .config --disable LOCALVERSION_AUTO \
+              --set-str LOCALVERSION "${{ inputs.localversion }}"
+          fi
+          touch .scmversion
+
+          make ARCH=arm64 LLVM=1 olddefconfig
+
+          echo "=== release-relevant ==="
+          grep -E '^(CONFIG_LOCALVERSION=|CONFIG_LOCALVERSION_AUTO=|CONFIG_MODVERSIONS|CONFIG_MODULE_SIG|CONFIG_MODULE_SIG_FORCE|CONFIG_MODULE_SIG_PROTECT|CONFIG_MODULE_SIG_ALL|CONFIG_MODULE_FORCE_LOAD|CONFIG_TRIM_UNUSED_KSYMS|CONFIG_LTO|CONFIG_PREEMPT|CONFIG_SMP)' .config || true
+          echo "=== drivers ==="
+          grep -E '^CONFIG_(MAC80211|CFG80211|RTL8XXXU|ATH9K_HTC|ATH9K_HW|ATH9K_COMMON|RT2800USB|RT2X00LIB|CARL9170|ZD1211RW|MT7601U|RTL8187|RFKILL)' .config || true
+
+      - name: Build vmlinux
+        run: |
+          set -euo pipefail
+          cd kernel
+          export PATH="$HOME/tc/clang/bin:$PATH"
+          make ARCH=arm64 LLVM=1 -j"$(nproc)" vmlinux
+
+      - name: Build wifi modules
+        run: |
+          set -euo pipefail
+          cd kernel
+          export PATH="$HOME/tc/clang/bin:$PATH"
+          set +e
+          make ARCH=arm64 LLVM=1 -j"$(nproc)" \
+            net/wireless/ net/mac80211/ drivers/net/wireless/ drivers/net/usb/ 2>&1 | tail -80
+          rc=$?
+          set -e
+          echo "targeted build rc=$rc"
+          # fall back to a full module build if the targeted build did not emit modules
+          if ! find drivers/net/wireless net/wireless net/mac80211 -name '*.ko' | grep -q .; then
+            echo "falling back to full modules build"
+            make ARCH=arm64 LLVM=1 -j"$(nproc)" modules
+          fi
+
+      - name: Collect modules
+        run: |
+          set -euo pipefail
+          cd kernel
+          OUT="$GITHUB_WORKSPACE/out"
+          mkdir -p "$OUT"
+          found=0
+          for m in cfg80211 mac80211 \
+                   rtl8xxxu r8188eu \
+                   ath9k_hw ath9k_common ath9k_htc ath9k \
+                   rt2x00lib rt2x00usb rt2800lib rt2800usb \
+                   carl9170 zd1211rw mt7601u rtl8187 eeprom_93cx6; do
+            f=$(find . -name "$m.ko" -not -path "./tools/*" | head -1)
+            if [ -n "$f" ]; then cp "$f" "$OUT/"; found=$((found+1)); fi
+          done
+          echo "copied $found modules"
+          ls -la "$OUT"
+          echo "=== vermagic of each ==="
+          for f in "$OUT"/*.ko; do
+            [ -f "$f" ] || continue
+            printf '%-24s ' "$(basename "$f")"
+            modinfo -F vermagic "$f" 2>/dev/null || echo "?"
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tigerkitty-wifi-modules-${{ github.run_number }}
+          path: out/*.ko
+          if-no-files-found: error
