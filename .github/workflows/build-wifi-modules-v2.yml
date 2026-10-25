@@ -89,10 +89,24 @@ jobs:
             ./scripts/config --file .config --module "$m"
           done
 
+          # ---- ABI CRITICAL ----
+          # /vendor/lib/modules/mac80211.ko (MediaTek build, vermagic
+          # 6.6.58-android15-8-g33c1ba9ffede-4k) was compiled with
+          # CONFIG_NL80211_TESTMODE=y, so its `struct ieee80211_ops` carries the
+          # two extra pointers testmode_cmd/testmode_dump right after
+          # set_coverage_class (0x1a0/0x1a8).  Our device.config has that option
+          # *off*, which shifted every op after it by -2 pointers, so the vendor
+          # mac80211 read ops->wake_tx_queue at 0x2f0 while our rtl8xxxu_ops
+          # stored it at 0x2e0 -> read NULL -> WARN at net/mac80211/main.c:660 ->
+          # ieee80211_alloc_hw() = NULL -> probe error -12.
+          # Verified field-by-field against the vendor module's .BTF: with this
+          # option enabled all 109 named members line up exactly (delta 0).
+          ./scripts/config --file .config --enable NL80211_TESTMODE
+
           make ARCH=arm64 LLVM=1 olddefconfig
 
           echo "=== sanity ==="
-          grep -E '^(CONFIG_LOCALVERSION=|CONFIG_LOCALVERSION_AUTO=|CONFIG_CFI_CLANG=|CONFIG_LTO|CONFIG_MODVERSIONS|CONFIG_MODULE_SIG=|CONFIG_DEBUG_INFO_BTF_MODULES=|# CONFIG_MODVERSIONS)' .config || true
+          grep -E '^(CONFIG_LOCALVERSION=|CONFIG_LOCALVERSION_AUTO=|CONFIG_CFI_CLANG=|CONFIG_LTO|CONFIG_MODVERSIONS|CONFIG_MODULE_SIG=|CONFIG_DEBUG_INFO_BTF_MODULES=|CONFIG_NL80211_TESTMODE=|# CONFIG_MODVERSIONS|# CONFIG_NL80211_TESTMODE)' .config || true
           echo "=== drivers ==="
           grep -E '^CONFIG_(CFG80211|MAC80211|RTL8XXXU|ATH9K_HTC|ATH9K_HW|ATH9K_COMMON|EEPROM_93CX6)=' .config || true
 
@@ -116,6 +130,15 @@ jobs:
             make ARCH=arm64 LLVM=1 -j"$(nproc)" M=drivers/net/wireless/realtek/rtl8xxxu modules 2>&1 | tail -20
           fi
           make ARCH=arm64 LLVM=1 -j"$(nproc)" M=drivers/misc/eeprom modules 2>&1 | tail -10
+
+      - name: ABI guard (ieee80211_ops must match vendor mac80211.ko bit for bit)
+        env:
+          KBUILD_MODPOST_WARN: "1"
+        run: |
+          set -euo pipefail
+          cd kernel
+          make ARCH=arm64 LLVM=1 -j"$(nproc)" M="$GITHUB_WORKSPACE/abicheck" modules 2>&1 | tail -15
+          echo "ABI guard compiled: struct ieee80211_ops layout matches the vendor mac80211 (wake_tx_queue @ 0x2f0)"
 
       - name: Verify ABI + collect
         run: |
