@@ -137,7 +137,7 @@ jobs:
         run: |
           set -euo pipefail
           cd kernel
-          make ARCH=arm64 LLVM=1 -j"$(nproc)" M="$GITHUB_WORKSPACE/abicheck" modules 2>&1 | tail -15
+          make ARCH=arm64 LLVM=1 -j"$(nproc)" M="$GITHUB_WORKSPACE/abicheck" modules 2>&1 | tail -40
           echo "ABI guard compiled: struct ieee80211_ops layout matches the vendor mac80211 (wake_tx_queue @ 0x2f0)"
 
       - name: Verify ABI + collect

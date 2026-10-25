@@ -8,8 +8,10 @@
 // fails with -ENOMEM.
 //
 // The expected offsets below were extracted field-by-field from the .BTF
-// section of the vendor mac80211.ko.  Compiling this file fails the CI build if
-// any field ever drifts (e.g. someone disables CONFIG_NL80211_TESTMODE again).
+// section of the vendor mac80211.ko (build-time base btf str_len 2464538).
+// Compiling this file fails the CI build if any field ever drifts - e.g. if
+// CONFIG_NL80211_TESTMODE gets disabled again, which shifts everything after
+// set_coverage_class by two pointers and was the actual cause of error -12.
 #include <linux/module.h>
 #include <linux/stddef.h>
 #include <net/mac80211.h>
@@ -135,7 +137,12 @@ BUILD_BUG_ON(offsetof(struct ieee80211_ops, change_vif_links) != 0x398);
 BUILD_BUG_ON(offsetof(struct ieee80211_ops, change_sta_links) != 0x3a0);
 BUILD_BUG_ON(offsetof(struct ieee80211_ops, set_hw_timestamp) != 0x3a8);
 BUILD_BUG_ON(offsetof(struct ieee80211_ops, net_setup_tc) != 0x3b0);
-BUILD_BUG_ON(sizeof(struct ieee80211_ops) != 0x3b8);
+
+BUILD_BUG_ON(offsetof(struct ieee80211_ops, android_kabi_reserved1) != 0x3b8);
+BUILD_BUG_ON(offsetof(struct ieee80211_ops, android_kabi_reserved2) != 0x3c0);
+BUILD_BUG_ON(offsetof(struct ieee80211_ops, android_kabi_reserved3) != 0x3c8);
+BUILD_BUG_ON(offsetof(struct ieee80211_ops, android_kabi_reserved4) != 0x3d0);
+BUILD_BUG_ON(sizeof(struct ieee80211_ops) != 0x3d8);
 	return 0;
 }
 
