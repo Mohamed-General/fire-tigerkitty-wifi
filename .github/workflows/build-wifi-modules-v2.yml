@@ -102,6 +102,11 @@ jobs:
           make ARCH=arm64 LLVM=1 -j"$(nproc)" modules_prepare
 
       - name: Build modules
+        env:
+          # no vmlinux -> no Module.symvers; we load against the modules that the
+          # ROM already has loaded (cfg80211/mac80211), so unresolved-symbol
+          # errors from modpost are expected and harmless at build time.
+          KBUILD_MODPOST_WARN: "1"
         run: |
           set -euo pipefail
           cd kernel
