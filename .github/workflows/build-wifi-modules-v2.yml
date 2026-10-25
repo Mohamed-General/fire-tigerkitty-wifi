@@ -1,0 +1,146 @@
+name: Build wifi modules (device config v2)
+
+# WHY THIS EXISTS
+# ---------------
+# v1 built the modules with `make defconfig` + the repo fragment.  That produced
+# modules whose .gnu.linkonce.this_module section was 1344 bytes, while the
+# kernel that ships on the device (and every /vendor/lib/modules/*.ko) uses
+# 1536 bytes -> the kernel's `struct module` layout is different.
+#
+# On this MTK tree load_module() does:
+#       err = module_patient_check_exists(info->mod->name, ...)
+# and when the .gnu.linkonce.this_module size check in setup_load_info() fails,
+# info->mod stays NULL -> strlen(NULL->name) -> strlen(0x18) -> kernel panic
+# (pc __pi_strlen, lr module_patient_check_exists, x0 = 0x18).
+#
+# FIX: build with the *exact* config of the running kernel, taken from
+# /proc/config.gz on the device (committed as device.config).
+# The build also verifies, per module, that this_module == 0x600 (1536) and that
+# the vermagic matches, and it uses clang 18 so kCFI (CONFIG_CFI_CLANG=y on this
+# kernel) type ids are emitted like the vendor modules have.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: "kernel branch / tag / commit"
+        type: string
+        default: "main"
+      full_wireless:
+        description: "build the whole drivers/net/wireless tree (slower)"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/lib/jvm /usr/local/.ghcup 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev python3 rsync cpio zip unzip \
+            xz-utils kmod dwarves clang lld llvm
+          clang --version | head -2
+          ld.lld --version
+          pahole --version
+          df -h /
+
+      - name: Clone kernel source
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ inputs.kernel_ref }}" \
+            https://github.com/lvd3767/android_kernel_xiaomi_fire_gki6.6-tigerkitty.git kernel
+          cd kernel
+          git log --oneline -1
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile
+
+      - name: Config = exact device config
+        run: |
+          set -euo pipefail
+          cd kernel
+          cp ../device.config .config
+
+          # reproduce the running kernel's release string exactly
+          printf '%s' '-TigerKitty-by-B055nian-g93bbc15e5f81-dirty' > .scmversion
+
+          # vendors / selectors
+          for s in WLAN WLAN_VENDOR_REALTEK WLAN_VENDOR_ATH WLAN_VENDOR_RALINK \
+                   WLAN_VENDOR_MEDIATEK WLAN_VENDOR_ZYDAS WLAN_VENDOR_ATMEL RT2X00; do
+            ./scripts/config --file .config --enable "$s"
+          done
+
+          # the actual driver modules we want
+          for m in CFG80211 MAC80211 RTL8XXXU ATH9K_HTC ATH9K_HW ATH9K_COMMON ATH \
+                   RT2X00LIB RT2X00USB RT2800LIB RT2800USB CARL9170 ZD1211RW \
+                   MT7601U RTL8187 USB_RTL8187 EEPROM_93CX6; do
+            ./scripts/config --file .config --module "$m"
+          done
+
+          make ARCH=arm64 LLVM=1 olddefconfig
+
+          echo "=== sanity ==="
+          grep -E '^(CONFIG_LOCALVERSION=|CONFIG_LOCALVERSION_AUTO=|CONFIG_CFI_CLANG=|CONFIG_LTO|CONFIG_MODVERSIONS|CONFIG_MODULE_SIG=|CONFIG_DEBUG_INFO_BTF_MODULES=|# CONFIG_MODVERSIONS)' .config || true
+          echo "=== drivers ==="
+          grep -E '^CONFIG_(CFG80211|MAC80211|RTL8XXXU|ATH9K_HTC|ATH9K_HW|ATH9K_COMMON|EEPROM_93CX6)=' .config || true
+
+      - name: Prepare kernel tree
+        run: |
+          cd kernel
+          make ARCH=arm64 LLVM=1 -j"$(nproc)" modules_prepare
+
+      - name: Build modules
+        run: |
+          set -euo pipefail
+          cd kernel
+          if [ "${{ inputs.full_wireless }}" = "true" ]; then
+            make ARCH=arm64 LLVM=1 -j"$(nproc)" M=drivers/net/wireless modules 2>&1 | tail -40
+          else
+            make ARCH=arm64 LLVM=1 -j"$(nproc)" M=drivers/net/wireless/realtek/rtl8xxxu modules 2>&1 | tail -20
+          fi
+          make ARCH=arm64 LLVM=1 -j"$(nproc)" M=drivers/misc/eeprom modules 2>&1 | tail -10
+
+      - name: Verify ABI + collect
+        run: |
+          set -euo pipefail
+          cd kernel
+          OUT="$GITHUB_WORKSPACE/out"; mkdir -p "$OUT"
+          fail=0
+          for f in $(find drivers/net/wireless drivers/misc/eeprom -name '*.ko' | sort); do
+            sz=$(python3 "$GITHUB_WORKSPACE/tools/secsize.py" "$f" | awk -F'this_module=' '{print $2}' | awk '{print $1}')
+            vm=$(modinfo -F vermagic "$f" 2>/dev/null || echo "?")
+            kcfi=$(grep -c kcfi "$f" 2>/dev/null || true)
+            printf '%-26s this_module=%-6s kcfi=%s ver=%s\n' "$(basename "$f")" "$sz" "$kcfi" "$vm"
+            if [ "$sz" != "1536" ]; then
+              echo "::error file=$(basename "$f")::struct module size $sz != 1536 -> would panic the kernel"
+              fail=1
+            fi
+            grep -q '6.6.143-TigerKitty-by-B055nian-g93bbc15e5f81-dirty' <<<"$vm" || {
+              echo "::error file=$(basename "$f")::bad vermagic [$vm]"
+              fail=1
+            }
+            cp "$f" "$OUT/"
+          done
+          echo "collected $(ls "$OUT" | wc -l) modules"
+          ls -la "$OUT"
+          exit $fail
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wifi-modules-devcfg-${{ github.run_number }}
+          path: out/*.ko
+          if-no-files-found: warn
