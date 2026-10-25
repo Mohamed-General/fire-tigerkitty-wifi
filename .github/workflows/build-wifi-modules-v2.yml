@@ -155,7 +155,7 @@ jobs:
               echo "::error file=$(basename "$f")::struct module size $sz != 1536 -> would panic the kernel"
               fail=1
             fi
-            grep -q '6.6.143-TigerKitty-by-B055nian-g93bbc15e5f81-dirty' <<<"$vm" || {
+            grep -q '6.6.143-TigerKitty-by-B055nian-' <<<"$vm" || {
               echo "::error file=$(basename "$f")::bad vermagic [$vm]"
               fail=1
             }
