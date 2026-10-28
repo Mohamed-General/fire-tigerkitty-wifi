@@ -1,0 +1,142 @@
+name: Build wifi modules (v3 - cfg80211 + mac80211 + drivers)
+
+# WHY v3
+# ------
+# v2 built only drivers/net/wireless (realtek/ath/ralink/...) with the exact
+# device config, so this_module == 1536 (fixes the MTK module_patient_check_exists
+# panic). BUT it never built cfg80211/mac80211 - those live in
+# net/wireless and net/mac80211, and the device kernel has:
+#        # CONFIG_CFG80211 is not set
+#        # CFG80211 needs to be enabled for MAC80211
+# so the ROM has no cfg80211/mac80211 at all. Loading rtl8xxxu.ko always died
+# with "Unknown symbol cfg80211_...".
+#
+# v3 builds the whole stack as modules against the device's exact config:
+#        rfkill.ko -> cfg80211.ko -> mac80211.ko -> rtl8xxxu.ko
+# and forces UTS_RELEASE to the running kernel's release string:
+#        6.6.143-TigerKitty-by-B055nian-g93bbc15e5f81-dirty
+# (LOCALVERSION_AUTO is disabled so git describe does not leak another hash).
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: "kernel branch / tag"
+        type: string
+        default: "main"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/lib/jvm /usr/local/.ghcup 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev python3 rsync cpio zip unzip \
+            xz-utils kmod dwarves clang lld llvm
+          clang --version | head -2
+
+      - name: Clone kernel source
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ inputs.kernel_ref }}" \
+            https://github.com/lvd3767/android_kernel_xiaomi_fire_gki6.6-tigerkitty.git kernel
+          cd kernel
+          git log --oneline -1
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile
+
+      - name: Config = exact device config + full wifi stack
+        run: |
+          set -euo pipefail
+          cd kernel
+          cp ../device.config .config
+
+          # ---- reproduce the running kernel's UTS_RELEASE exactly ----
+          ./scripts/config --file .config --set-str LOCALVERSION \
+            "-TigerKitty-by-B055nian-g93bbc15e5f81-dirty"
+          ./scripts/config --file .config --disable LOCALVERSION_AUTO
+
+          # selectors
+          for s in WLAN WLAN_VENDOR_REALTEK WLAN_VENDOR_ATH WLAN_VENDOR_RALINK \
+                   WLAN_VENDOR_MEDIATEK WLAN_VENDOR_ZYDAS WLAN_VENDOR_ATMEL \
+                   RT2X00 NL80211_TESTMODE; do
+            ./scripts/config --file .config --enable "$s"
+          done
+
+          # modules: the whole cfg80211 -> mac80211 -> driver stack
+          for m in RFKILL CFG80211 MAC80211 RTL8XXXU ATH9K_HTC ATH9K_HW ATH9K_COMMON ATH \
+                   RT2X00LIB RT2X00USB RT2800LIB RT2800USB CARL9170 ZD1211RW \
+                   MT7601U RTL8187 USB_RTL8187 EEPROM_93CX6; do
+            ./scripts/config --file .config --module "$m"
+          done
+
+          make ARCH=arm64 LLVM=1 olddefconfig
+
+          echo "=== sanity ==="
+          grep -E '^(CONFIG_LOCALVERSION=|CONFIG_LOCALVERSION_AUTO=|# CONFIG_LOCALVERSION_AUTO|CONFIG_CFI_CLANG=|CONFIG_CFG80211=|CONFIG_MAC80211=|CONFIG_RTL8XXXU=|CONFIG_RFKILL=|CONFIG_NL80211_TESTMODE=|# CONFIG_MODVERSIONS)' .config || true
+
+      - name: Prepare kernel tree
+        run: |
+          cd kernel
+          make ARCH=arm64 LLVM=1 -j"$(nproc)" modules_prepare
+
+      - name: Build modules (rfkill -> cfg80211 -> mac80211 -> drivers)
+        env:
+          KBUILD_MODPOST_WARN: "1"
+        run: |
+          set -euo pipefail
+          cd kernel
+          for d in net/rfkill net/wireless net/mac80211 drivers/net/wireless/realtek/rtl8xxxu; do
+            echo "=========== $d ==========="
+            make ARCH=arm64 LLVM=1 -j"$(nproc)" M="$d" modules 2>&1 | tail -25
+          done
+
+      - name: ABI guard (ieee80211_ops layout)
+        env:
+          KBUILD_MODPOST_WARN: "1"
+        run: |
+          set -euo pipefail
+          cd kernel
+          make ARCH=arm64 LLVM=1 -j"$(nproc)" M="$GITHUB_WORKSPACE/abicheck" modules 2>&1 | tail -20
+
+      - name: Verify this_module / vermagic / kcfi and collect
+        run: |
+          set -euo pipefail
+          cd kernel
+          EXPECT="6.6.143-TigerKitty-by-B055nian-g93bbc15e5f81-dirty SMP preempt mod_unload aarch64"
+          OUT="$GITHUB_WORKSPACE/out"; mkdir -p "$OUT"
+          fail=0
+          for f in $(find net/rfkill net/wireless net/mac80211 drivers/net/wireless/realtek/rtl8xxxu \
+                       -name '*.ko' | sort); do
+            sz=$(python3 "$GITHUB_WORKSPACE/tools/secsize.py" "$f" | awk -F'this_module=' '{print $2}' | awk '{print $1}')
+            vm=$(modinfo -F vermagic "$f" 2>/dev/null || echo "?")
+            kcfi=$(grep -c kcfi "$f" 2>/dev/null || true)
+            printf '%-20s this_module=%-5s kcfi=%-4s %s\n' "$(basename "$f")" "$sz" "$kcfi" "$vm"
+            [ "$sz" = "1536" ] || { echo "::error file=$(basename "$f")::this_module=$sz (need 1536)"; fail=1; }
+            [ "$vm" = "$EXPECT" ] || { echo "::error file=$(basename "$f")::vermagic [$vm]"; fail=1; }
+            cp "$f" "$OUT/"
+          done
+          echo
+          ls -la "$OUT"
+          exit $fail
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wifi-modules-v3-${{ github.run_number }}
+          path: out/*.ko
+          if-no-files-found: warn
