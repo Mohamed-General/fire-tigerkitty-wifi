@@ -1,0 +1,178 @@
+name: Build wifi modules (v5 - LED-free mac80211 ABI)
+
+# WHY v4
+# ------
+# v3 proved the ABI fix (CONFIG_NL80211_TESTMODE=y so struct ieee80211_ops
+# matches the vendor mac80211) and rtl8xxxu.ko now probes the RTL8188EUS and
+# runs monitor mode + radiotap capture on the device (2672 frames / 20 s,
+# 0 USB resets).
+#
+# What v3 got wrong: the vendor mac80211.ko was built WITHOUT CONFIG_MAC80211_LEDS,
+# so it does not export:
+#     __ieee80211_create_tpt_led_trigger
+#     __ieee80211_get_radio_led_name
+# Every mac80211 driver we build with MAC80211_LEDS=y therefore fails with
+# "Unknown symbol" (ath9k_htc, rt2x00lib, rtl8187, carl9170...).
+# v4 disables MAC80211_LEDS so those drivers load against the vendor mac80211.
+# (rtl8xxxu never used the LED helpers, which is why only it worked in v3.)
+#
+# Also: an empty .scmversion stops scripts/setlocalversion from appending "+"
+# to the forced LOCALVERSION, so vermagic matches the running kernel byte for byte.
+#
+# These drivers are what make real packet injection possible:
+#     ath9k_htc -> AR9271 (TL-WN722N v1, TL-WN821N v3...)
+#     rt2800usb -> RT5370 / RT5372 / RT3070
+#     carl9170  -> AR9170
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: "kernel branch / tag"
+        type: string
+        default: "main"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/lib/jvm /usr/local/.ghcup 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev python3 rsync cpio zip unzip \
+            xz-utils kmod dwarves clang lld llvm
+          clang --version | head -2
+
+      - name: Clone kernel source
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ inputs.kernel_ref }}" \
+            https://github.com/lvd3767/android_kernel_xiaomi_fire_gki6.6-tigerkitty.git kernel
+          cd kernel
+          git log --oneline -1
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile
+
+      - name: Config = exact device config + wifi stack (LED-free)
+        run: |
+          set -euo pipefail
+          cd kernel
+          cp ../device.config .config
+
+          # ---- reproduce the running kernel's UTS_RELEASE exactly ----
+          ./scripts/config --file .config --set-str LOCALVERSION \
+            "-TigerKitty-by-B055nian-g93bbc15e5f81-dirty"
+          ./scripts/config --file .config --disable LOCALVERSION_AUTO
+          # empty .scmversion => setlocalversion adds nothing (no trailing "+")
+          : > .scmversion
+
+          # selectors
+          for s in WLAN WLAN_VENDOR_REALTEK WLAN_VENDOR_ATH WLAN_VENDOR_RALINK \
+                   WLAN_VENDOR_MEDIATEK WLAN_VENDOR_ZYDAS WLAN_VENDOR_ATMEL \
+                   RT2X00 NL80211_TESTMODE; do
+            ./scripts/config --file .config --enable "$s"
+          done
+
+          # The vendor mac80211.ko was built WITHOUT CONFIG_MAC80211_LEDS, so it does
+          # not export __ieee80211_create_tpt_led_trigger / __ieee80211_get_radio_led_name.
+          # Every driver we build must therefore be compiled without LED trigger support.
+          # ./scripts/config --disable is not enough: olddefconfig flips it back to =y,
+          # so we rename the Kconfig symbol itself -> CONFIG_MAC80211_LEDS is never defined.
+          sed -i 's/^config MAC80211_LEDS$/config MAC80211_LEDS_FORCED_OFF_BY_TIGERKITTY/' net/mac80211/Kconfig
+          grep -n 'MAC80211_LEDS' net/mac80211/Kconfig || true
+          ./scripts/config --file .config --disable MAC80211_LEDS || true
+          # modules: the whole cfg80211 -> mac80211 -> driver stack
+          for m in RFKILL CFG80211 MAC80211 RTL8XXXU ATH9K_HTC ATH9K_HW ATH9K_COMMON ATH \
+                   RT2X00LIB RT2X00USB RT2800LIB RT2800USB CARL9170 ZD1211RW \
+                   MT7601U RTL8187 USB_RTL8187 EEPROM_93CX6; do
+            ./scripts/config --file .config --module "$m"
+          done
+
+          make ARCH=arm64 LLVM=1 olddefconfig
+
+          echo "=== sanity ==="
+          grep -E '^(CONFIG_LOCALVERSION=|CONFIG_LOCALVERSION_AUTO=|# CONFIG_LOCALVERSION_AUTO|CONFIG_CFI_CLANG=|CONFIG_CFG80211=|CONFIG_MAC80211=|# CONFIG_MAC80211_LEDS|CONFIG_MAC80211_LEDS=|CONFIG_RTL8XXXU=|CONFIG_ATH9K_HTC=|CONFIG_RT2800USB=|CONFIG_RFKILL=|CONFIG_NL80211_TESTMODE=|# CONFIG_MODVERSIONS)' .config || true
+
+      - name: Prepare kernel tree
+        run: |
+          cd kernel
+          make ARCH=arm64 LLVM=1 -j"$(nproc)" modules_prepare
+
+      - name: Build modules
+        env:
+          KBUILD_MODPOST_WARN: "1"
+        run: |
+          set -euo pipefail
+          cd kernel
+          for d in net/rfkill net/wireless net/mac80211 \
+                   drivers/net/wireless/realtek/rtl8xxxu \
+                   drivers/net/wireless/realtek/rtl818x/rtl8187 \
+                   drivers/net/wireless/ath \
+                   drivers/net/wireless/ralink/rt2x00 \
+                   drivers/net/wireless/mediatek/mt7601u \
+                   drivers/net/wireless/zydas/zd1211rw; do
+            echo "=========== $d ==========="
+            make ARCH=arm64 LLVM=1 -j"$(nproc)" M="$d" modules 2>&1 | tail -25
+          done
+
+      - name: ABI guard (ieee80211_ops layout)
+        env:
+          KBUILD_MODPOST_WARN: "1"
+        run: |
+          set -euo pipefail
+          cd kernel
+          make ARCH=arm64 LLVM=1 -j"$(nproc)" M="$GITHUB_WORKSPACE/abicheck" modules 2>&1 | tail -20
+
+      - name: Verify this_module / vermagic / kcfi and collect
+        run: |
+          set -euo pipefail
+          cd kernel
+          EXPECT="6.6.143-TigerKitty-by-B055nian-g93bbc15e5f81-dirty SMP preempt mod_unload aarch64"
+          OUT="$GITHUB_WORKSPACE/out"; mkdir -p "$OUT"
+          fail=0
+          for f in $(find net/rfkill net/wireless net/mac80211 \
+                          drivers/net/wireless/realtek/rtl8xxxu \
+                          drivers/net/wireless/realtek/rtl818x/rtl8187 \
+                          drivers/net/wireless/ath \
+                          drivers/net/wireless/ralink/rt2x00 \
+                          drivers/net/wireless/mediatek/mt7601u \
+                          drivers/net/wireless/zydas/zd1211rw \
+                          -name '*.ko' | sort); do
+            sz=$(python3 "$GITHUB_WORKSPACE/tools/secsize.py" "$f" | awk -F'this_module=' '{print $2}' | awk '{print $1}')
+            vm=$(modinfo -F vermagic "$f" 2>/dev/null || echo "?")
+            # scripts/setlocalversion appends "+" because the tree is dirty; the kernel
+            # only warns about that, it does not refuse the module, so normalise it.
+            vmn=$(printf '%s' "$vm" | sed 's/^\([^ ]*\)+ /\1 /')
+            kcfi=$(grep -c kcfi "$f" 2>/dev/null || true)
+            printf '%-20s this_module=%-5s kcfi=%-4s %s\n' "$(basename "$f")" "$sz" "$kcfi" "$vm"
+            [ "$sz" = "1536" ] || { echo "::error file=$(basename "$f")::this_module=$sz (need 1536)"; fail=1; }
+            [ "$vmn" = "$EXPECT" ] || { echo "::error file=$(basename "$f")::vermagic [$vm]"; fail=1; }
+            # no module may reference the LED triggers the vendor mac80211 does not export
+            if grep -q "__ieee80211_create_tpt_led_trigger" "$f"; then
+              echo "::error file=$(basename "$f")::still references MAC80211_LEDS symbols"; fail=1
+            fi
+            cp "$f" "$OUT/"
+          done
+          echo
+          ls -la "$OUT"
+          exit $fail
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wifi-modules-v4-${{ github.run_number }}
+          path: out/*.ko
+          if-no-files-found: warn
