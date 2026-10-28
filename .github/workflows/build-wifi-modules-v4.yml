@@ -113,7 +113,7 @@ jobs:
           cd kernel
           for d in net/rfkill net/wireless net/mac80211 \
                    drivers/net/wireless/realtek/rtl8xxxu \
-                   drivers/net/wireless/realtek/rtl8187 \
+                   drivers/net/wireless/realtek/rtl818x/rtl8187 \
                    drivers/net/wireless/ath \
                    drivers/net/wireless/ralink/rt2x00 \
                    drivers/net/wireless/mediatek/mt7601u \
@@ -139,7 +139,7 @@ jobs:
           fail=0
           for f in $(find net/rfkill net/wireless net/mac80211 \
                           drivers/net/wireless/realtek/rtl8xxxu \
-                          drivers/net/wireless/realtek/rtl8187 \
+                          drivers/net/wireless/realtek/rtl818x/rtl8187 \
                           drivers/net/wireless/ath \
                           drivers/net/wireless/ralink/rt2x00 \
                           drivers/net/wireless/mediatek/mt7601u \
