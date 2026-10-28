@@ -43,19 +43,33 @@ jobs:
           sudo apt-get clean
           df -h /
 
-      - name: Install LLVM 19 and build deps
+      - name: Install LLVM and build deps
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             ca-certificates wget gnupg bc bison flex libssl-dev libelf-dev \
             python3 rsync cpio zip unzip xz-utils kmod dwarves
-          wget -qO- https://apt.llvm.org/llvm-svn.asc | sudo tee /etc/apt/trusted.gpg.d/llvm-svn.asc > /dev/null
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main" | \
+
+          # The stock TigerKitty kernel was built with LLVM 19 (Debian clang 19.1.7),
+          # so we use LLVM 19 as well: CFI type hashes stay in the same family and
+          # the vendor modules keep loading.  The LLVM apt key has been removed
+          # from the mirror, hence [trusted=yes].
+          echo "deb [trusted=yes] http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main" | \
             sudo tee /etc/apt/sources.list.d/llvm19.list > /dev/null
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends clang-19 lld-19 llvm-19
-          clang-19 --version | head -2
+          sudo apt-get update -qq || true
+
+          FLAG=-19
+          if ! sudo apt-get install -y --no-install-recommends clang-19 lld-19 llvm-19; then
+            echo "::warning::clang-19 unavailable - falling back to clang-18"
+            sudo rm -f /etc/apt/sources.list.d/llvm19.list
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends clang-18 lld-18 llvm-18
+            FLAG=-18
+          fi
+          echo "LLVM_FLAG=$FLAG" >> "$GITHUB_ENV"
+          "clang$FLAG" --version | head -2
+          "ld.lld$FLAG" --version | head -1
 
       - name: Clone kernel source
         run: |
@@ -84,7 +98,7 @@ jobs:
           ./scripts/config --file .config --module  USB_IPHETH
           ./scripts/config --file .config --module  USB_NET_RNDIS_HOST
 
-          make ARCH=arm64 LLVM=-19 olddefconfig
+          make ARCH=arm64 LLVM=${{ env.LLVM_FLAG }} olddefconfig
 
           echo "=== delta (must be set) ==="
           grep -E '^(CONFIG_USB_CONFIGFS_RNDIS=|CONFIG_USB_F_RNDIS=|CONFIG_USB_CONFIGFS_F_PRINTER=|CONFIG_USB_F_PRINTER=|CONFIG_USB_IPHETH=|CONFIG_USB_NET_RNDIS_HOST=)' .config
@@ -99,7 +113,7 @@ jobs:
         run: |
           set -euo pipefail
           cd kernel
-          make ARCH=arm64 LLVM=-19 -j"$(nproc)" Image
+          make ARCH=arm64 LLVM=${{ env.LLVM_FLAG }} -j"$(nproc)" Image
           gzip -9 -c arch/arm64/boot/Image > arch/arm64/boot/Image.gz
           ls -l arch/arm64/boot/Image arch/arm64/boot/Image.gz
           echo "=== release string inside the image ==="
@@ -111,8 +125,8 @@ jobs:
         run: |
           set -euo pipefail
           cd kernel
-          make ARCH=arm64 LLVM=-19 -j"$(nproc)" modules_prepare
-          make ARCH=arm64 LLVM=-19 -j"$(nproc)" M=drivers/net/usb modules 2>&1 | tail -20 || true
+          make ARCH=arm64 LLVM=${{ env.LLVM_FLAG }} -j"$(nproc)" modules_prepare
+          make ARCH=arm64 LLVM=${{ env.LLVM_FLAG }} -j"$(nproc)" M=drivers/net/usb modules 2>&1 | tail -20 || true
           find drivers/net/usb -name 'rndis_host.ko' -o -name 'ipheth.ko' | sort
 
       - name: Verify and collect
