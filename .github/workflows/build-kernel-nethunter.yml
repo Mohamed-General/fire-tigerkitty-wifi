@@ -7,6 +7,11 @@ name: Build NetHunter kernel (6.6 TigerKitty)
 #   + CONFIG_USB_CONFIGFS_RNDIS     -> NetHunter "USB Arsenal" network (Windows)
 #   + CONFIG_USB_CONFIGFS_F_PRINTER -> USB printer emulation
 #   + CONFIG_USB_IPHETH / RNDIS_HOST (modules) -> tethering from other phones
+#   + CONFIG_BT_HCIBTUSB / BT_HCIVHCI (modules) -> external BT dongles + VHCI
+#   + CONFIG_USB_SERIAL_{CP210X,PL2303,CH341,OPTION,GENERIC,SIMPLE} -> USB-TTL
+#     adapters (Arduino / ESP32 / 4G modems); none of these exist in /vendor
+#   + CONFIG_SQUASHFS (XZ/LZ4/ZSTD)  -> Kali chroot images
+#   + CONFIG_NF_TABLES + NFT_*       -> modern nftables firewall rules
 #
 # Everything else (cfg80211, mac80211, MTK wifi, USB gadget) is left exactly
 # as in the running kernel, so the vendor modules keep loading unchanged and
@@ -92,11 +97,52 @@ jobs:
           ./scripts/config --file .config --disable LOCALVERSION_AUTO
           : > .scmversion
 
-          # --- the only additions ---
+          # --- the only additions (gadgets) ---
           ./scripts/config --file .config --enable  USB_CONFIGFS_RNDIS
           ./scripts/config --file .config --enable  USB_CONFIGFS_F_PRINTER
           ./scripts/config --file .config --module  USB_IPHETH
           ./scripts/config --file .config --module  USB_NET_RNDIS_HOST
+
+          # --- round 2: BT USB dongles, USB-serial adapters, nftables, squashfs ---
+          # CONFIG_BT is already =m in device.config, so the BT drivers stay modules.
+          ./scripts/config --file .config --module  BT_HCIBTUSB
+          ./scripts/config --file .config --module  BT_HCIVHCI
+
+          # USB-serial: /vendor/lib/modules has NO serial driver at all today,
+          # so every adapter except FTDI/CDC-ACM is dead on this device.
+          ./scripts/config --file .config --module  USB_SERIAL_CP210X
+          ./scripts/config --file .config --module  USB_SERIAL_PL2303
+          ./scripts/config --file .config --module  USB_SERIAL_CH341
+          ./scripts/config --file .config --module  USB_SERIAL_OPTION
+          ./scripts/config --file .config --module  USB_SERIAL_SIMPLE
+          ./scripts/config --file .config --enable  USB_SERIAL_GENERIC
+
+          # squashfs: Kali/NetHunter chroot images (CONFIG_XZ_DEC is already =y)
+          ./scripts/config --file .config --enable  SQUASHFS
+          ./scripts/config --file .config --enable  SQUASHFS_XZ
+          ./scripts/config --file .config --enable  SQUASHFS_LZ4
+          ./scripts/config --file .config --enable  SQUASHFS_ZSTD
+
+          # nftables: the ROM only ships the legacy iptables stack
+          ./scripts/config --file .config --enable  NF_TABLES
+          ./scripts/config --file .config --enable  NF_TABLES_INET
+          ./scripts/config --file .config --enable  NF_TABLES_IPV4
+          ./scripts/config --file .config --enable  NF_TABLES_IPV6
+          ./scripts/config --file .config --enable  NF_TABLES_NETDEV
+          ./scripts/config --file .config --enable  NFT_COMPAT
+          ./scripts/config --file .config --enable  NFT_CT
+          ./scripts/config --file .config --enable  NFT_NAT
+          ./scripts/config --file .config --enable  NFT_MASQ
+          ./scripts/config --file .config --enable  NFT_REDIR
+          ./scripts/config --file .config --enable  NFT_LOG
+          ./scripts/config --file .config --enable  NFT_REJECT
+          ./scripts/config --file .config --enable  NFT_COUNTER
+          ./scripts/config --file .config --enable  NFT_LIMIT
+          ./scripts/config --file .config --enable  NFT_QUOTA
+          ./scripts/config --file .config --enable  NFT_HASH
+          ./scripts/config --file .config --enable  NFT_FIB
+          ./scripts/config --file .config --enable  NFT_SOCKET
+          ./scripts/config --file .config --enable  NFT_TPROXY
 
           make ARCH=arm64 LLVM=${{ env.LLVM_FLAG }} olddefconfig
 
@@ -106,6 +152,16 @@ jobs:
             echo "::error::NetHunter gadget option got dropped by olddefconfig"
             exit 1
           fi
+
+          echo "=== round-2 delta (must be set) ==="
+          grep -E '^(CONFIG_BT_HCIBTUSB=|CONFIG_BT_HCIVHCI=|CONFIG_USB_SERIAL_(CP210X|PL2303|CH341|OPTION|SIMPLE|GENERIC)=|CONFIG_(SQUASHFS|SQUASHFS_XZ|SQUASHFS_LZ4|NF_TABLES|NF_TABLES_INET|NFT_CT|NFT_NAT|NFT_MASQ)=)' .config || true
+          for o in BT_HCIBTUSB BT_HCIVHCI USB_SERIAL_CP210X USB_SERIAL_PL2303 \
+                   USB_SERIAL_CH341 USB_SERIAL_OPTION SQUASHFS NF_TABLES NFT_CT NFT_NAT; do
+            grep -qE "^CONFIG_${o}=[my]$" .config || {
+              echo "::error::CONFIG_${o} got dropped by olddefconfig (dependency missing)"
+              exit 1
+            }
+          done
           echo "=== untouched (must still match the running kernel) ==="
           grep -E '^(CONFIG_LOCALVERSION=|CONFIG_CFI_CLANG=|CONFIG_USB_CONFIGFS_F_HID=|CONFIG_USB_F_HID=|CONFIG_USB_CONFIGFS_F_FS=|CONFIG_MODULES=|CONFIG_MODVERSIONS=|# CONFIG_CFG80211)' .config || true
 
@@ -119,15 +175,26 @@ jobs:
           echo "=== release string inside the image ==="
           strings arch/arm64/boot/Image | grep -m3 -E '6\.6\.143.*TigerKitty' || true
 
-      - name: Build helper modules (RNDIS/iPhone tethering)
+      - name: Build helper modules (RNDIS/iPhone tethering, USB serial, BT USB)
         env:
           KBUILD_MODPOST_WARN: "1"
         run: |
-          set -euo pipefail
+          set -uo pipefail
           cd kernel
           make ARCH=arm64 LLVM=${{ env.LLVM_FLAG }} -j"$(nproc)" modules_prepare
-          make ARCH=arm64 LLVM=${{ env.LLVM_FLAG }} -j"$(nproc)" M=drivers/net/usb modules 2>&1 | tail -20 || true
-          find drivers/net/usb -name 'rndis_host.ko' -o -name 'ipheth.ko' | sort
+          # Only the directories we actually need (a full `make modules` would take
+          # far longer and would trip over MTK's out-of-tree vendor drivers).
+          for d in drivers/net/usb drivers/usb/serial drivers/bluetooth; do
+            echo "=== M=$d ==="
+            make ARCH=arm64 LLVM=${{ env.LLVM_FLAG }} -j"$(nproc)" M="$d" modules 2>&1 | tail -15 || true
+            find "$d" -name '*.ko' | sort
+          done
+          echo "=== required modules present? ==="
+          for k in drivers/usb/serial/usbserial.ko drivers/usb/serial/ch341.ko \
+                   drivers/usb/serial/cp210x.ko drivers/usb/serial/pl2303.ko \
+                   drivers/bluetooth/btusb.ko drivers/bluetooth/hci_vhci.ko; do
+            [ -f "$k" ] && echo "OK   $k" || echo "::warning::missing $k"
+          done
 
       - name: Verify and collect
         run: |
@@ -138,7 +205,9 @@ jobs:
           cp arch/arm64/boot/Image    "$OUT/"
           cp .config                  "$OUT/meta/config"
           cp System.map               "$OUT/meta/System.map"
-          find drivers/net/usb -name '*.ko' -exec cp {} "$OUT/modules/" \;
+          for d in drivers/net/usb drivers/usb/serial drivers/bluetooth; do
+            find "$d" -name '*.ko' -exec cp {} "$OUT/modules/" \;
+          done
           {
             echo "source: $(git rev-parse --short HEAD)"
             echo "clang:  $(clang-19 --version | head -1)"
