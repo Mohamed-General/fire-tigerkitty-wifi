@@ -180,6 +180,18 @@ jobs:
           ./scripts/config --file .config --disable NL80211_TESTMODE
           ./scripts/config --file .config --disable DEVTMPFS_MOUNT
 
+          # ath9k/Kconfig does:
+          #     select MAC80211_LEDS if LEDS_CLASS=y || LEDS_CLASS=MAC80211
+          # A `select` beats `scripts/config --disable`, so olddefconfig turned
+          # the option back on and every driver then referenced
+          # __ieee80211_create_tpt_led_trigger, which the loaded mac80211.ko
+          # does not export. Neutralise the select in the source before
+          # resolving the config.
+          while IFS= read -r kf; do
+            echo "neutralising 'select MAC80211_LEDS' in $kf"
+            sed -i 's/^\([[:space:]]*\)select MAC80211_LEDS/\1# select MAC80211_LEDS (nethunter: must match loaded mac80211)/' "$kf"
+          done < <(grep -rl 'select MAC80211_LEDS' drivers/net/wireless 2>/dev/null || true)
+
           make ARCH=arm64 LLVM=${{ env.LLVM_FLAG }} olddefconfig
 
           echo "=== delta (must be set) ==="
@@ -208,10 +220,14 @@ jobs:
               exit 1
             }
           done
-          grep -qE '^# CONFIG_MAC80211_LEDS is not set' .config || {
+          if ! grep -qE '^# CONFIG_MAC80211_LEDS is not set' .config; then
             echo "::error::CONFIG_MAC80211_LEDS came back - drivers would fail to insmod"
+            echo "--- .config lines mentioning it ---"
+            grep -n 'MAC80211_LEDS' .config || true
+            echo "--- remaining selects in the source ---"
+            grep -rn 'select MAC80211_LEDS' drivers/net/wireless || true
             exit 1
-          }
+          fi
           grep -qE '^CONFIG_MAC80211=m' .config || {
             echo "::error::CONFIG_MAC80211 is not a module"
             exit 1
