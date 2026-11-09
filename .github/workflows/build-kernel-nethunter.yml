@@ -144,6 +144,42 @@ jobs:
           ./scripts/config --file .config --enable  NFT_SOCKET
           ./scripts/config --file .config --enable  NFT_TPROXY
 
+          # --- round 4: USB Wi-Fi (mirrors Kali's armor34plus GKI device) ---
+          # The vendor switches must be on, otherwise Kconfig deletes every
+          # driver symbol below them and olddefconfig drops them silently.
+          ./scripts/config --file .config --enable  WLAN_VENDOR_ATH
+          ./scripts/config --file .config --enable  WLAN_VENDOR_MEDIATEK
+          ./scripts/config --file .config --enable  WLAN_VENDOR_RALINK
+          ./scripts/config --file .config --enable  WLAN_VENDOR_REALTEK
+          ./scripts/config --file .config --enable  WLAN_VENDOR_ZYDAS
+
+          ./scripts/config --file .config --module  ATH_COMMON
+          ./scripts/config --file .config --module  ATH9K_HW
+          ./scripts/config --file .config --module  ATH9K_COMMON
+          ./scripts/config --file .config --module  ATH9K_HTC
+          ./scripts/config --file .config --module  CARL9170
+
+          ./scripts/config --file .config --module  RT2X00
+          ./scripts/config --file .config --module  RT2X00_LIB
+          ./scripts/config --file .config --module  RT2X00_LIB_USB
+          ./scripts/config --file .config --module  RT2800_LIB
+          ./scripts/config --file .config --module  RT2800USB
+
+          ./scripts/config --file .config --module  MT7601U
+          ./scripts/config --file .config --module  RTL_CARDS
+          ./scripts/config --file .config --module  RTL8187
+
+          # MAC80211_LEDS must match the mac80211.ko that is actually loaded on
+          # the phone (built without LED support). If it is left on, every
+          # driver that references __ieee80211_create_tpt_led_trigger fails to
+          # insmod with "Unknown symbol".
+          ./scripts/config --file .config --disable MAC80211_LEDS
+          ./scripts/config --file .config --disable RT2X00_LIB_LEDS
+          ./scripts/config --file .config --disable RTL8187_LEDS
+          ./scripts/config --file .config --disable CARL9170_LEDS
+          ./scripts/config --file .config --disable NL80211_TESTMODE
+          ./scripts/config --file .config --disable DEVTMPFS_MOUNT
+
           make ARCH=arm64 LLVM=${{ env.LLVM_FLAG }} olddefconfig
 
           echo "=== delta (must be set) ==="
@@ -162,6 +198,26 @@ jobs:
               exit 1
             }
           done
+
+          echo "=== round-4 delta (USB Wi-Fi) ==="
+          for o in WLAN_VENDOR_ATH WLAN_VENDOR_MEDIATEK WLAN_VENDOR_RALINK \
+                   WLAN_VENDOR_REALTEK ATH9K_HTC CARL9170 RT2800USB MT7601U \
+                   RTL8187 RTL_CARDS; do
+            grep -qE "^CONFIG_${o}=[my]$" .config || {
+              echo "::error::CONFIG_${o} got dropped by olddefconfig (vendor switch still off?)"
+              exit 1
+            }
+          done
+          grep -qE '^# CONFIG_MAC80211_LEDS is not set' .config || {
+            echo "::error::CONFIG_MAC80211_LEDS came back - drivers would fail to insmod"
+            exit 1
+          }
+          grep -qE '^CONFIG_MAC80211=m' .config || {
+            echo "::error::CONFIG_MAC80211 is not a module"
+            exit 1
+          }
+          grep -E '^(CONFIG_(CFG80211|MAC80211|ATH9K_HTC|CARL9170|RT2800USB|MT7601U|RTL8187|RTL_CARDS)=)' .config
+
           echo "=== untouched (must still match the running kernel) ==="
           grep -E '^(CONFIG_LOCALVERSION=|CONFIG_CFI_CLANG=|CONFIG_USB_CONFIGFS_F_HID=|CONFIG_USB_F_HID=|CONFIG_USB_CONFIGFS_F_FS=|CONFIG_MODULES=|CONFIG_MODVERSIONS=|# CONFIG_CFG80211)' .config || true
 
@@ -184,7 +240,8 @@ jobs:
           make ARCH=arm64 LLVM=${{ env.LLVM_FLAG }} -j"$(nproc)" modules_prepare
           # Only the directories we actually need (a full `make modules` would take
           # far longer and would trip over MTK's out-of-tree vendor drivers).
-          for d in drivers/net/usb drivers/usb/serial drivers/bluetooth; do
+          for d in drivers/net/usb drivers/usb/serial drivers/bluetooth \
+                   net/wireless net/mac80211 drivers/net/wireless; do
             echo "=== M=$d ==="
             make ARCH=arm64 LLVM=${{ env.LLVM_FLAG }} -j"$(nproc)" M="$d" modules 2>&1 | tail -15 || true
             find "$d" -name '*.ko' | sort
@@ -192,7 +249,12 @@ jobs:
           echo "=== required modules present? ==="
           for k in drivers/usb/serial/usbserial.ko drivers/usb/serial/ch341.ko \
                    drivers/usb/serial/cp210x.ko drivers/usb/serial/pl2303.ko \
-                   drivers/bluetooth/btusb.ko drivers/bluetooth/hci_vhci.ko; do
+                   drivers/bluetooth/btusb.ko drivers/bluetooth/hci_vhci.ko \
+                   net/wireless/cfg80211.ko net/mac80211/mac80211.ko \
+                   drivers/net/wireless/ath/ath9k/ath9k_htc.ko \
+                   drivers/net/wireless/ralink/rt2x00/rt2800usb.ko \
+                   drivers/net/wireless/realtek/rtl8187/rtl8187.ko \
+                   drivers/net/wireless/mediatek/mt7601u/mt7601u.ko; do
             [ -f "$k" ] && echo "OK   $k" || echo "::warning::missing $k"
           done
 
@@ -205,7 +267,8 @@ jobs:
           cp arch/arm64/boot/Image    "$OUT/"
           cp .config                  "$OUT/meta/config"
           cp System.map               "$OUT/meta/System.map"
-          for d in drivers/net/usb drivers/usb/serial drivers/bluetooth; do
+          for d in drivers/net/usb drivers/usb/serial drivers/bluetooth \
+                   net/wireless net/mac80211 drivers/net/wireless; do
             find "$d" -name '*.ko' -exec cp {} "$OUT/modules/" \;
           done
           {
